@@ -415,7 +415,7 @@ class JointDiffusion(nn.Module):
         self.register_buffer('posterior_variance', posterior_variance)
 
         # Joint denoiser network
-        self.denoiser = JointDenoiser(time_dim=64, hidden_dim=256, num_cross_attn_layers=3)
+        self.denoiser = JointDenoiser(time_dim=64, hidden_dim=128, num_cross_attn_layers=3)
 
     def q_sample(self, x_0, t, noise=None):
         """Forward diffusion: add noise to x_0 at timestep t."""
@@ -541,8 +541,7 @@ class JointDiffusion(nn.Module):
             img, label = self.p_sample_step(img, label, t_batch,
                                            denoise_image=True, denoise_label=True)
 
-        # Convert label back to probabilities
-        label = (label + 1) / 2
+        # Convert label to probabilities using softmax
         label = F.softmax(label, dim=-1)
 
         return img, label
@@ -573,8 +572,7 @@ class JointDiffusion(nn.Module):
                                            denoise_image=False,  # Keep image frozen
                                            denoise_label=True)   # Only denoise label
 
-        # Convert to probabilities
-        label = (label + 1) / 2
+        # Convert to probabilities using softmax
         label = F.softmax(label, dim=-1)
 
         return label
@@ -727,7 +725,7 @@ def visualize_denoising_process(model, dataloader, device, num_steps_to_show=8):
 
             if idx % snapshot_interval == 0 or idx == len(timesteps) - 1:
                 img_snapshots.append(img_t.clone())
-                label_probs = F.softmax((label_t.clone() + 1) / 2, dim=-1)
+                label_probs = F.softmax(label_t.clone(), dim=-1)
                 label_snapshots.append(label_probs)
 
     # Create figure
@@ -832,11 +830,11 @@ def evaluate(model, dataloader, device, num_inference_steps=50):
 
 def main():
     # Hyperparameters
-    batch_size = 1024
+    batch_size = 128
     num_epochs = 100
-    learning_rate = 1e-4
-    num_timesteps = 100
-    num_inference_steps = 100
+    learning_rate = 1e-3
+    num_timesteps = 10
+    num_inference_steps = 10
     viz_every_n_epochs = 5  # Visualize every N epochs
 
     # Device
