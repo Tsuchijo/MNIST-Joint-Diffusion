@@ -766,36 +766,47 @@ def train_epoch(model, dataloader, optimizer, device, epoch):
     total_img_loss = 0
     total_label_loss = 0
 
-    pbar = tqdm(dataloader, desc=f"Epoch {epoch}")
-    for batch_idx, (images, labels) in enumerate(pbar):
-        images, labels = images.to(device), labels.to(device)
+    # Train over the dataset 10 times per epoch
+    num_repeats = 10
+    total_batches = len(dataloader) * num_repeats
 
-        optimizer.zero_grad()
-        loss, img_loss, label_loss = model.p_losses(images, labels)
-        loss.backward()
-        optimizer.step()
+    pbar = tqdm(total=total_batches, desc=f"Epoch {epoch}")
+    global_batch_idx = 0
 
-        total_loss += loss.item()
-        total_img_loss += img_loss
-        total_label_loss += label_loss
+    for repeat in range(num_repeats):
+        for batch_idx, (images, labels) in enumerate(dataloader):
+            images, labels = images.to(device), labels.to(device)
 
-        # Log batch metrics
-        if batch_idx % 100 == 0:
-            wandb.log({
-                "batch/loss": loss.item(),
-                "batch/img_loss": img_loss,
-                "batch/label_loss": label_loss,
-                "batch/step": epoch * len(dataloader) + batch_idx,
+            optimizer.zero_grad()
+            loss, img_loss, label_loss = model.p_losses(images, labels)
+            loss.backward()
+            optimizer.step()
+
+            total_loss += loss.item()
+            total_img_loss += img_loss
+            total_label_loss += label_loss
+
+            # Log batch metrics
+            if global_batch_idx % 100 == 0:
+                wandb.log({
+                    "batch/loss": loss.item(),
+                    "batch/img_loss": img_loss,
+                    "batch/label_loss": label_loss,
+                    "batch/step": (epoch - 1) * total_batches + global_batch_idx,
+                })
+
+            # Update progress bar
+            pbar.set_postfix({
+                'repeat': f'{repeat + 1}/{num_repeats}',
+                'loss': f'{loss.item():.4f}',
+                'img': f'{img_loss:.4f}',
+                'label': f'{label_loss:.4f}'
             })
+            pbar.update(1)
+            global_batch_idx += 1
 
-        # Update progress bar
-        pbar.set_postfix({
-            'loss': f'{loss.item():.4f}',
-            'img': f'{img_loss:.4f}',
-            'label': f'{label_loss:.4f}'
-        })
-
-    n = len(dataloader)
+    pbar.close()
+    n = total_batches
     return total_loss / n, total_img_loss / n, total_label_loss / n
 
 
@@ -821,12 +832,12 @@ def evaluate(model, dataloader, device, num_inference_steps=50):
 
 def main():
     # Hyperparameters
-    batch_size = 128
-    num_epochs = 20
+    batch_size = 1024
+    num_epochs = 100
     learning_rate = 1e-4
-    num_timesteps = 1000
-    num_inference_steps = 50
-    viz_every_n_epochs = 2  # Visualize every N epochs
+    num_timesteps = 100
+    num_inference_steps = 100
+    viz_every_n_epochs = 5  # Visualize every N epochs
 
     # Device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
