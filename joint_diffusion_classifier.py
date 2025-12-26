@@ -41,51 +41,43 @@ class SinusoidalTimeEmbedding(nn.Module):
 
 
 # ============================================================================
-# Cross-Attention Module
+# Shared Embedding Processor
 # ============================================================================
 
-class CrossAttention(nn.Module):
+class SharedProcessor(nn.Module):
     """
-    Cross-attention layer allowing image and label representations to interact.
-    Query comes from one modality, Key/Value from the other.
+    Processes concatenated embeddings from both modalities.
+    Allows information sharing through shared layers.
     """
-    def __init__(self, dim, num_heads=4):
+    def __init__(self, hidden_dim=256, num_layers=3):
         super().__init__()
-        self.num_heads = num_heads
-        self.head_dim = dim // num_heads
-        self.scale = self.head_dim ** -0.5
 
-        self.q_proj = nn.Linear(dim, dim)
-        self.k_proj = nn.Linear(dim, dim)
-        self.v_proj = nn.Linear(dim, dim)
-        self.out_proj = nn.Linear(dim, dim)
-        self.norm = nn.LayerNorm(dim)
+        # Process concatenated embeddings (2 * hidden_dim input)
+        layers = []
+        for i in range(num_layers):
+            if i == 0:
+                layers.extend([
+                    nn.Linear(hidden_dim * 2, hidden_dim * 2),
+                    nn.LayerNorm(hidden_dim * 2),
+                    nn.SiLU(),
+                ])
+            else:
+                layers.extend([
+                    nn.Linear(hidden_dim * 2, hidden_dim * 2),
+                    nn.LayerNorm(hidden_dim * 2),
+                    nn.SiLU(),
+                ])
 
-    def forward(self, x, context):
+        self.layers = nn.Sequential(*layers)
+
+    def forward(self, x):
         """
         Args:
-            x: (B, N, D) - queries
-            context: (B, M, D) - keys and values
+            x: (B, hidden_dim * 2) - concatenated embeddings
         Returns:
-            (B, N, D) - attention output
+            (B, hidden_dim * 2) - processed shared embeddings
         """
-        B, N, D = x.shape
-
-        # Project to Q, K, V
-        q = self.q_proj(x).reshape(B, N, self.num_heads, self.head_dim).transpose(1, 2)
-        k = self.k_proj(context).reshape(B, -1, self.num_heads, self.head_dim).transpose(1, 2)
-        v = self.v_proj(context).reshape(B, -1, self.num_heads, self.head_dim).transpose(1, 2)
-
-        # Attention
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        attn = F.softmax(attn, dim=-1)
-
-        # Apply attention to values
-        out = (attn @ v).transpose(1, 2).reshape(B, N, D)
-        out = self.out_proj(out)
-
-        # Residual connection
-        return self.norm(x + out)
+        return self.layers(x) + x  # Residual connection
 
 
 # ============================================================================
@@ -94,8 +86,7 @@ class CrossAttention(nn.Module):
 
 class ImageDenoiser(nn.Module):
     """
-    Processes noisy images. Uses convolutional layers and produces
-    spatial feature maps that can be cross-attended with label features.
+    Processes noisy images and produces a fixed-size embedding vector.
     """
     def __init__(self, time_dim=64, hidden_dim=256):
         super().__init__()
@@ -108,7 +99,7 @@ class ImageDenoiser(nn.Module):
             nn.Linear(hidden_dim, hidden_dim),
         )
 
-        # Input convolution (1 -> hidden_dim channels)
+        # Input convolution (1 -> 64 channels)
         self.input_conv = nn.Conv2d(1, 64, 3, padding=1)
 
         # Early conv layers (28x28 -> 14x14)
@@ -131,8 +122,13 @@ class ImageDenoiser(nn.Module):
             nn.SiLU(),
         )
 
-        # Flatten to sequence for cross-attention (7x7 = 49 spatial locations)
-        self.spatial_to_seq = nn.Conv2d(256, hidden_dim, 1)
+        # Global pooling and projection to embedding
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.to_embedding = nn.Sequential(
+            nn.Linear(256, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
 
     def forward(self, x, t):
         """
@@ -140,7 +136,7 @@ class ImageDenoiser(nn.Module):
             x: (B, 1, 28, 28) - noisy images
             t: (B,) - timesteps
         Returns:
-            (B, 49, hidden_dim) - spatial feature sequence for cross-attention
+            (B, hidden_dim) - image embedding
         """
         # Time embedding
         t_emb = self.time_embed(t)
@@ -151,30 +147,29 @@ class ImageDenoiser(nn.Module):
         h = self.early_conv(h)
         h = self.middle_conv(h)  # (B, 256, 7, 7)
 
-        # Convert to sequence for cross-attention
-        h = self.spatial_to_seq(h)  # (B, hidden_dim, 7, 7)
+        # Global average pooling
+        h = self.pool(h).squeeze(-1).squeeze(-1)  # (B, 256)
 
-        # Add time embedding to each spatial location
-        B, D, H, W = h.shape
-        t_emb = t_emb.view(B, D, 1, 1).expand(B, D, H, W)
+        # Project to embedding and add time
+        h = self.to_embedding(h)  # (B, hidden_dim)
         h = h + t_emb
-
-        # Flatten spatial dimensions: (B, hidden_dim, H, W) -> (B, H*W, hidden_dim)
-        h = h.flatten(2).transpose(1, 2)
 
         return h
 
 
 class ImageReconstructor(nn.Module):
     """
-    Reconstructs image from spatial features after cross-attention.
+    Reconstructs image from shared embeddings.
     Predicts the noise that was added to the image.
     """
     def __init__(self, hidden_dim=256):
         super().__init__()
 
-        # Reshape sequence back to spatial
-        self.seq_to_spatial = nn.Linear(hidden_dim, 256)
+        # Project from shared embedding to spatial features
+        self.from_shared = nn.Sequential(
+            nn.Linear(hidden_dim * 2, 256 * 7 * 7),
+            nn.SiLU(),
+        )
 
         # Upsampling path (7x7 -> 14x14 -> 28x28)
         self.up1 = nn.Sequential(
@@ -195,15 +190,15 @@ class ImageReconstructor(nn.Module):
     def forward(self, h):
         """
         Args:
-            h: (B, 49, hidden_dim) - features after cross-attention
+            h: (B, hidden_dim * 2) - shared embeddings
         Returns:
             (B, 1, 28, 28) - predicted noise in image space
         """
         B = h.size(0)
 
-        # Project and reshape to spatial
-        h = self.seq_to_spatial(h)  # (B, 49, 256)
-        h = h.transpose(1, 2).reshape(B, 256, 7, 7)
+        # Project to spatial features
+        h = self.from_shared(h)  # (B, 256 * 7 * 7)
+        h = h.reshape(B, 256, 7, 7)
 
         # Upsample
         h = self.up1(h)  # (B, 128, 14, 14)
@@ -219,12 +214,10 @@ class ImageReconstructor(nn.Module):
 
 class LabelDenoiser(nn.Module):
     """
-    Processes noisy label vectors (10-dimensional one-hot encodings).
-    Produces a sequence of features that can cross-attend with image features.
+    Processes noisy label vectors and produces a fixed-size embedding.
     """
-    def __init__(self, label_dim=10, time_dim=64, hidden_dim=256, seq_len=8):
+    def __init__(self, label_dim=10, time_dim=64, hidden_dim=256):
         super().__init__()
-        self.seq_len = seq_len
 
         # Time embedding
         self.time_embed = SinusoidalTimeEmbedding(time_dim)
@@ -234,11 +227,15 @@ class LabelDenoiser(nn.Module):
             nn.Linear(hidden_dim, hidden_dim),
         )
 
-        # Input projection: expand label vector to sequence
-        self.input_proj = nn.Linear(label_dim, hidden_dim * seq_len)
+        # Input projection
+        self.input_proj = nn.Sequential(
+            nn.Linear(label_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
 
-        # Early layers
-        self.early_layers = nn.Sequential(
+        # Processing layers
+        self.layers = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.SiLU(),
@@ -253,42 +250,35 @@ class LabelDenoiser(nn.Module):
             x: (B, 10) - noisy label vectors
             t: (B,) - timesteps
         Returns:
-            (B, seq_len, hidden_dim) - label feature sequence for cross-attention
+            (B, hidden_dim) - label embedding
         """
-        B = x.size(0)
-
         # Time embedding
         t_emb = self.time_embed(t)
         t_emb = self.time_mlp(t_emb)  # (B, hidden_dim)
 
-        # Project label to sequence
-        h = self.input_proj(x)  # (B, hidden_dim * seq_len)
-        h = h.reshape(B, self.seq_len, -1)  # (B, seq_len, hidden_dim)
+        # Project label
+        h = self.input_proj(x)  # (B, hidden_dim)
 
-        # Add time embedding to each position
-        h = h + t_emb.unsqueeze(1)
+        # Add time embedding
+        h = h + t_emb
 
-        # Process through early layers (applied to each position)
-        h_list = []
-        for i in range(h.size(1)):
-            h_list.append(self.early_layers(h[:, i]))
-        h = torch.stack(h_list, dim=1)
+        # Process
+        h = self.layers(h)
 
         return h
 
 
 class LabelReconstructor(nn.Module):
     """
-    Reconstructs label vector from features after cross-attention.
+    Reconstructs label vector from shared embeddings.
     Predicts the noise that was added to the label.
     """
-    def __init__(self, label_dim=10, hidden_dim=256, seq_len=8):
+    def __init__(self, label_dim=10, hidden_dim=256):
         super().__init__()
-        self.seq_len = seq_len
 
-        # Process sequence
+        # Process shared embeddings
         self.layers = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
+            nn.Linear(hidden_dim * 2, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.SiLU(),
             nn.Linear(hidden_dim, hidden_dim),
@@ -296,26 +286,17 @@ class LabelReconstructor(nn.Module):
             nn.SiLU(),
         )
 
-        # Output projection: collapse sequence back to label vector
-        self.output_proj = nn.Linear(hidden_dim * seq_len, label_dim)
+        # Output projection to label space
+        self.output_proj = nn.Linear(hidden_dim, label_dim)
 
     def forward(self, h):
         """
         Args:
-            h: (B, seq_len, hidden_dim) - features after cross-attention
+            h: (B, hidden_dim * 2) - shared embeddings
         Returns:
             (B, 10) - predicted noise in label space
         """
-        B = h.size(0)
-
-        # Process each position
-        h_list = []
-        for i in range(h.size(1)):
-            h_list.append(self.layers(h[:, i]))
-        h = torch.stack(h_list, dim=1)
-
-        # Collapse sequence to label vector
-        h = h.reshape(B, -1)  # (B, hidden_dim * seq_len)
+        h = self.layers(h)
         return self.output_proj(h)  # (B, 10)
 
 
@@ -325,27 +306,20 @@ class LabelReconstructor(nn.Module):
 
 class JointDenoiser(nn.Module):
     """
-    Joint denoiser that processes both images and labels with cross-attention
-    in the middle layers, allowing information sharing between modalities.
+    Joint denoiser that processes both images and labels by concatenating
+    their embeddings and processing through shared layers.
     """
-    def __init__(self, time_dim=64, hidden_dim=256, num_cross_attn_layers=3):
+    def __init__(self, time_dim=64, hidden_dim=256, num_shared_layers=3):
         super().__init__()
 
-        # Separate denoiser paths
+        # Separate encoders for each modality
         self.image_denoiser = ImageDenoiser(time_dim, hidden_dim)
         self.label_denoiser = LabelDenoiser(label_dim=10, time_dim=time_dim, hidden_dim=hidden_dim)
 
-        # Cross-attention layers in the middle
-        self.cross_attn_layers = nn.ModuleList([
-            nn.ModuleDict({
-                'img_to_label': CrossAttention(hidden_dim, num_heads=4),
-                'label_to_img': CrossAttention(hidden_dim, num_heads=4),
-                'img_self': CrossAttention(hidden_dim, num_heads=4),
-                'label_self': CrossAttention(hidden_dim, num_heads=4),
-            }) for _ in range(num_cross_attn_layers)
-        ])
+        # Shared processor for concatenated embeddings
+        self.shared_processor = SharedProcessor(hidden_dim, num_layers=num_shared_layers)
 
-        # Reconstructors
+        # Separate decoders for each modality
         self.image_reconstructor = ImageReconstructor(hidden_dim)
         self.label_reconstructor = LabelReconstructor(label_dim=10, hidden_dim=hidden_dim)
 
@@ -359,23 +333,19 @@ class JointDenoiser(nn.Module):
             predicted_img_noise: (B, 1, 28, 28)
             predicted_label_noise: (B, 10)
         """
-        # Get initial features from each modality
-        img_feats = self.image_denoiser(img_noisy, t)  # (B, 49, hidden_dim)
-        label_feats = self.label_denoiser(label_noisy, t)  # (B, 8, hidden_dim)
+        # Get embeddings from each modality
+        img_emb = self.image_denoiser(img_noisy, t)  # (B, hidden_dim)
+        label_emb = self.label_denoiser(label_noisy, t)  # (B, hidden_dim)
 
-        # Apply cross-attention layers
-        for layer in self.cross_attn_layers:
-            # Self-attention within each modality
-            img_feats = layer['img_self'](img_feats, img_feats)
-            label_feats = layer['label_self'](label_feats, label_feats)
+        # Concatenate embeddings
+        shared_emb = torch.cat([img_emb, label_emb], dim=-1)  # (B, hidden_dim * 2)
 
-            # Cross-attention between modalities
-            img_feats = layer['label_to_img'](img_feats, label_feats)
-            label_feats = layer['img_to_label'](label_feats, img_feats)
+        # Process through shared layers
+        shared_emb = self.shared_processor(shared_emb)  # (B, hidden_dim * 2)
 
-        # Reconstruct noise predictions
-        predicted_img_noise = self.image_reconstructor(img_feats)
-        predicted_label_noise = self.label_reconstructor(label_feats)
+        # Decode to noise predictions
+        predicted_img_noise = self.image_reconstructor(shared_emb)
+        predicted_label_noise = self.label_reconstructor(shared_emb)
 
         return predicted_img_noise, predicted_label_noise
 
@@ -415,7 +385,7 @@ class JointDiffusion(nn.Module):
         self.register_buffer('posterior_variance', posterior_variance)
 
         # Joint denoiser network
-        self.denoiser = JointDenoiser(time_dim=64, hidden_dim=128, num_cross_attn_layers=3)
+        self.denoiser = JointDenoiser(time_dim=64, hidden_dim=128, num_shared_layers=3)
 
     def q_sample(self, x_0, t, noise=None):
         """Forward diffusion: add noise to x_0 at timestep t."""
@@ -434,7 +404,11 @@ class JointDiffusion(nn.Module):
 
     def p_losses(self, images, labels):
         """
-        Compute training loss by diffusing both images and labels jointly.
+        Compute training loss with conditional diffusion support.
+        Randomly trains on three scenarios:
+        1. Both modalities noised (joint diffusion)
+        2. Image noised, label clean (P(image|label))
+        3. Image clean, label noised (P(label|image) - classification)
 
         Args:
             images: (B, 1, 28, 28) MNIST images (normalized)
@@ -454,19 +428,35 @@ class JointDiffusion(nn.Module):
         img_noise = torch.randn_like(images)
         label_noise = torch.randn_like(label_vectors)
 
-        # Add noise to both modalities
-        img_noisy = self.q_sample(images, t, img_noise)
-        label_noisy = self.q_sample(label_vectors, t, label_noise)
+        # Randomly choose training mode: 0=both noised, 1=img noised, 2=label noised
+        mode = torch.randint(0, 3, (1,)).item()
 
-        # Predict noise for both modalities
-        pred_img_noise, pred_label_noise = self.denoiser(img_noisy, label_noisy, t.float())
+        if mode == 0:
+            # Both modalities noised (joint diffusion)
+            img_noisy = self.q_sample(images, t, img_noise)
+            label_noisy = self.q_sample(label_vectors, t, label_noise)
+            pred_img_noise, pred_label_noise = self.denoiser(img_noisy, label_noisy, t.float())
+            img_loss = F.mse_loss(pred_img_noise, img_noise)
+            label_loss = F.mse_loss(pred_label_noise, label_noise)
+            total_loss = img_loss + label_loss
 
-        # Compute losses
-        img_loss = F.mse_loss(pred_img_noise, img_noise)
-        label_loss = F.mse_loss(pred_label_noise, label_noise)
+        elif mode == 1:
+            # Image noised, label clean (P(image|label))
+            img_noisy = self.q_sample(images, t, img_noise)
+            label_noisy = label_vectors  # Clean label
+            pred_img_noise, pred_label_noise = self.denoiser(img_noisy, label_noisy, t.float())
+            img_loss = F.mse_loss(pred_img_noise, img_noise)
+            label_loss = torch.tensor(0.0, device=device)  # No label loss
+            total_loss = img_loss
 
-        # Combined loss (you can weight these differently if needed)
-        total_loss = img_loss + label_loss
+        else:  # mode == 2
+            # Image clean, label noised (P(label|image) - classification)
+            img_noisy = images  # Clean image
+            label_noisy = self.q_sample(label_vectors, t, label_noise)
+            pred_img_noise, pred_label_noise = self.denoiser(img_noisy, label_noisy, t.float())
+            img_loss = torch.tensor(0.0, device=device)  # No image loss
+            label_loss = F.mse_loss(pred_label_noise, label_noise)
+            total_loss = label_loss
 
         return total_loss, img_loss.item(), label_loss.item()
 
@@ -709,7 +699,7 @@ def visualize_denoising_process(model, dataloader, device, num_steps_to_show=8):
         label_t = torch.randn(batch_size, 10, device=device)
 
         # Create timestep schedule
-        total_steps = 50
+        total_steps = 10
         step_size = model.num_timesteps // total_steps
         timesteps = list(range(0, model.num_timesteps, step_size))[::-1]
 
@@ -850,7 +840,7 @@ def main():
             "learning_rate": learning_rate,
             "num_timesteps": num_timesteps,
             "num_inference_steps": num_inference_steps,
-            "architecture": "joint_diffusion_with_cross_attention",
+            "architecture": "joint_diffusion_with_concatenation_and_conditional_training",
         }
     )
 
