@@ -590,7 +590,7 @@ def visualize_flow_trajectory(model, dataloader, device, num_snapshots=8, num_st
     fig, axes = plt.subplots(1, len(trajectories), figsize=(20, 3))
     
     for i, (traj, t) in enumerate(zip(trajectories, times)):
-        probs = F.softmax(traj[0], dim=-1).cpu().numpy()
+        probs = F.softmax(traj[0], dim=-1).detach().cpu().numpy()
         axes[i].bar(range(10), probs, color='steelblue')
         axes[i].set_ylim([0, 1])
         axes[i].set_xlabel('Digit')
@@ -615,28 +615,31 @@ def train_epoch(model, dataloader, optimizer, device, epoch):
     total_img_loss = 0
     total_label_loss = 0
     num_repeats = 10
-    
-    pbar = tqdm(dataloader, desc=f"Epoch {epoch}")
-    
+
+    total_iters = len(dataloader) * num_repeats
+    pbar = tqdm(total=total_iters, desc=f"Epoch {epoch}")
+
     for _ in range(num_repeats):
-        for images, labels in pbar:
+        for images, labels in dataloader:
             images, labels = images.to(device), labels.to(device)
-            
+
             optimizer.zero_grad()
             loss, img_loss, label_loss = model.compute_loss(images, labels)
             loss.backward()
             optimizer.step()
-            
+
             total_loss += loss.item()
             total_img_loss += img_loss
             total_label_loss += label_loss
-            
+
             pbar.set_postfix({
                 'loss': f'{loss.item():.4f}',
                 'img': f'{img_loss:.4f}',
                 'label': f'{label_loss:.4f}'
             })
-    
+            pbar.update(1)
+
+    pbar.close()
     n = len(dataloader) * num_repeats
     return total_loss / n, total_img_loss / n, total_label_loss / n
 
