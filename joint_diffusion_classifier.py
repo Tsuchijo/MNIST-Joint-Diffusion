@@ -91,59 +91,124 @@ class CrossAttention(nn.Module):
 class ImageEncoder(nn.Module):
     def __init__(self, hidden_dim=256, time_dim=64):
         super().__init__()
-        
+
         self.time_embed = SinusoidalTimeEmbedding(time_dim)
         self.time_mlp = nn.Sequential(
             nn.Linear(time_dim, hidden_dim),
             nn.SiLU(),
             nn.Linear(hidden_dim, hidden_dim),
         )
-        
-        self.conv = nn.Sequential(
+
+        # Encoder with skip connections (U-Net style)
+        # Layer 1: 28x28
+        self.conv1 = nn.Sequential(
             nn.Conv2d(1, 64, 3, padding=1),
             nn.SiLU(),
+        )
+
+        # Layer 2: 14x14
+        self.conv2 = nn.Sequential(
             nn.Conv2d(64, 128, 3, stride=2, padding=1),
             nn.GroupNorm(8, 128),
             nn.SiLU(),
+        )
+
+        # Layer 3: 7x7 (bottleneck)
+        self.conv3 = nn.Sequential(
             nn.Conv2d(128, 256, 3, stride=2, padding=1),
             nn.GroupNorm(8, 256),
             nn.SiLU(),
-            nn.AdaptiveAvgPool2d(1),
         )
-        
+
+        self.pool = nn.AdaptiveAvgPool2d(1)
         self.proj = nn.Linear(256, hidden_dim)
-        
+
     def forward(self, x, t):
         """
         x: (B, 1, 28, 28) interpolated image
         t: (B,) continuous time in [0, 1]
+
+        Returns:
+            h: (B, hidden_dim) - bottleneck representation
+            skips: List of skip connection features
         """
         t_emb = self.time_mlp(self.time_embed(t))
-        h = self.conv(x).squeeze(-1).squeeze(-1)
-        h = self.proj(h)
-        return h + t_emb
+
+        # Encoder with skip connections
+        skip1 = self.conv1(x)         # (B, 64, 28, 28)
+        skip2 = self.conv2(skip1)      # (B, 128, 14, 14)
+        skip3 = self.conv3(skip2)      # (B, 256, 7, 7)
+
+        # Bottleneck
+        h = self.pool(skip3).squeeze(-1).squeeze(-1)  # (B, 256)
+        h = self.proj(h)  # (B, hidden_dim)
+        h = h + t_emb
+
+        return h, [skip1, skip2, skip3]
 
 
 class ImageDecoder(nn.Module):
     def __init__(self, hidden_dim=256):
         super().__init__()
-        
+
         self.proj = nn.Linear(hidden_dim, 256 * 7 * 7)
-        
-        self.deconv = nn.Sequential(
+
+        # Decoder with skip connections (U-Net style)
+        # Upsample from 7x7 to 14x14 (concatenate with skip2: 128 channels)
+        self.up1 = nn.Sequential(
             nn.ConvTranspose2d(256, 128, 4, stride=2, padding=1),
             nn.GroupNorm(8, 128),
             nn.SiLU(),
+        )
+        # After concat: 128 + 128 = 256 channels
+        self.conv1 = nn.Sequential(
+            nn.Conv2d(256, 128, 3, padding=1),
+            nn.GroupNorm(8, 128),
+            nn.SiLU(),
+        )
+
+        # Upsample from 14x14 to 28x28 (concatenate with skip1: 64 channels)
+        self.up2 = nn.Sequential(
             nn.ConvTranspose2d(128, 64, 4, stride=2, padding=1),
             nn.GroupNorm(8, 64),
             nn.SiLU(),
-            nn.Conv2d(64, 1, 3, padding=1),
         )
-        
-    def forward(self, h):
+        # After concat: 64 + 64 = 128 channels
+        self.conv2 = nn.Sequential(
+            nn.Conv2d(128, 64, 3, padding=1),
+            nn.GroupNorm(8, 64),
+            nn.SiLU(),
+        )
+
+        # Final output layer
+        self.out = nn.Conv2d(64, 1, 3, padding=1)
+
+    def forward(self, h, skips):
+        """
+        h: (B, hidden_dim) - bottleneck features
+        skips: [skip1, skip2, skip3] - skip connection features
+               skip1: (B, 64, 28, 28)
+               skip2: (B, 128, 14, 14)
+               skip3: (B, 256, 7, 7)
+        """
+        skip1, skip2, skip3 = skips
         B = h.size(0)
-        h = self.proj(h).view(B, 256, 7, 7)
-        return self.deconv(h)
+
+        # Project and reshape to spatial
+        h = self.proj(h).view(B, 256, 7, 7)  # (B, 256, 7, 7)
+
+        # Upsample to 14x14 and concatenate with skip2
+        h = self.up1(h)                      # (B, 128, 14, 14)
+        h = torch.cat([h, skip2], dim=1)     # (B, 256, 14, 14)
+        h = self.conv1(h)                    # (B, 128, 14, 14)
+
+        # Upsample to 28x28 and concatenate with skip1
+        h = self.up2(h)                      # (B, 64, 28, 28)
+        h = torch.cat([h, skip1], dim=1)     # (B, 128, 28, 28)
+        h = self.conv2(h)                    # (B, 64, 28, 28)
+
+        # Output
+        return self.out(h)                   # (B, 1, 28, 28)
 
 
 # ============================================================================
@@ -241,30 +306,30 @@ class JointVelocityField(nn.Module):
     def forward(self, img_t, label_t, t_img, t_label):
         """
         Predict velocities for both modalities.
-        
+
         Args:
             img_t: (B, 1, 28, 28) - image at time t_img
             label_t: (B, 10) - label at time t_label
             t_img: (B,) - continuous time for image [0, 1]
             t_label: (B,) - continuous time for label [0, 1] (INDEPENDENT)
-        
+
         Returns:
             v_img: (B, 1, 28, 28) - predicted velocity for image
             v_label: (B, 10) - predicted velocity for label
         """
-        h_img = self.img_encoder(img_t, t_img)
+        h_img, img_skips = self.img_encoder(img_t, t_img)
         h_label = self.label_encoder(label_t, t_label)
-        
+
         for cross_attn, img_ref, label_ref in zip(
             self.cross_attn_layers, self.img_refine, self.label_refine
         ):
             h_img, h_label = cross_attn(h_img, h_label)
             h_img = h_img + img_ref(h_img)
             h_label = h_label + label_ref(h_label)
-        
-        v_img = self.img_decoder(h_img)
+
+        v_img = self.img_decoder(h_img, img_skips)
         v_label = self.label_decoder(h_label)
-        
+
         return v_img, v_label
 
 
@@ -652,10 +717,10 @@ def evaluate(model, dataloader, device, num_steps=50):
 
 def main():
     # Config
-    batch_size = 2048
+    batch_size = 128
     num_epochs = 100
     learning_rate = 1e-3
-    hidden_dim = 128
+    hidden_dim = 256
     num_steps_train_eval = 50  # Steps for evaluation during training
     num_steps_final = 100  # Steps for final evaluation
     

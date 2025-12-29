@@ -238,10 +238,10 @@ def compute_fid_proxy(model, dataloader, device, num_steps=50):
 
 def main():
     # Config
-    batch_size = 2048
+    batch_size = 128
     num_epochs = 100
     learning_rate = 1e-3
-    hidden_dim = 128
+    hidden_dim = 256
     num_steps_train_eval = 50  # Steps for evaluation during training
     num_steps_final = 100  # Steps for final evaluation
 
