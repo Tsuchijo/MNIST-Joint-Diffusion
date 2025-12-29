@@ -1,16 +1,3 @@
-"""
-MNIST Classification via Joint Flow Matching
-
-Flow matching version of the UniCon-style joint diffusion.
-Key differences from DDPM:
-- Continuous t ∈ [0, 1] instead of discrete timesteps
-- Learn velocity field v(x_t, t) instead of noise predictor ε(x_t, t)
-- Linear interpolation path: x_t = (1-t)*x_0 + t*noise
-- Inference is ODE integration, step count fully decoupled from training
-
-Convention: t=0 is data, t=1 is noise (opposite of some papers, but intuitive)
-"""
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -421,7 +408,7 @@ class JointFlowMatching(nn.Module):
             modality='label'
         )
         
-        return F.softmax(label_final, dim=-1)
+        return label_final
     
     @torch.no_grad()
     def generate_from_label(self, labels, num_steps=50):
@@ -476,7 +463,7 @@ class JointFlowMatching(nn.Module):
             img = img - v_img * dt
             label = label - v_label * dt
         
-        return img, F.softmax(label, dim=-1)
+        return img, label
     
     @torch.no_grad()
     def predict(self, images, num_steps=50):
@@ -590,7 +577,7 @@ def visualize_flow_trajectory(model, dataloader, device, num_snapshots=8, num_st
     fig, axes = plt.subplots(1, len(trajectories), figsize=(20, 3))
     
     for i, (traj, t) in enumerate(zip(trajectories, times)):
-        probs = F.softmax(traj[0], dim=-1).detach().cpu().numpy()
+        probs = traj[0].detach().cpu().numpy()
         axes[i].bar(range(10), probs, color='steelblue')
         axes[i].set_ylim([0, 1])
         axes[i].set_xlabel('Digit')
