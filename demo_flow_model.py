@@ -30,8 +30,8 @@ from joint_diffusion_classifier import JointFlowMatching
 
 class Config:
     # Model settings
-    model_path = 'best_flow_model.pt'
-    hidden_dim = 128
+    model_path = 'models/best_flow_model.pt'
+    hidden_dim = 256
 
     # Evaluation settings
     num_steps_high_quality = 200  # High quality integration

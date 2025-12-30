@@ -12,3 +12,6 @@ wheels/
 wandb/
 data/
 *.pt
+demo_outputs/
+generated_images/
+mixed_digits/
